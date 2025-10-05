@@ -1,3 +1,5 @@
+
+
 #include <iostream>
 #include <fstream>
 #include <cstdio>
@@ -5,6 +7,7 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <vector>
+#include <set>
 
 extern "C" {
     #define STB_C_LEXER_IMPLEMENTATION
@@ -13,13 +16,13 @@ extern "C" {
 
 using namespace std;
 
-// Simple string builder
 struct String_Builder {
     char* items;
     size_t count;
     size_t capacity;
-    
+
     String_Builder() : items(nullptr), count(0), capacity(0) {}
+    ~String_Builder() { free(items); }
 };
 
 void sb_appendf(String_Builder* sb, const char* fmt, ...) {
@@ -28,16 +31,16 @@ void sb_appendf(String_Builder* sb, const char* fmt, ...) {
     va_start(args, fmt);
     int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-    
+
     if (len <= 0) return;
-    
+
     size_t new_size = sb->count + len;
     if (new_size >= sb->capacity) {
         sb->capacity = (sb->capacity == 0) ? 1024 : sb->capacity * 2;
         while (sb->capacity <= new_size) sb->capacity *= 2;
         sb->items = (char*)realloc(sb->items, sb->capacity);
     }
-    
+
     memcpy(sb->items + sb->count, buffer, len);
     sb->count = new_size;
 }
@@ -48,19 +51,19 @@ bool read_entire_file(const char* path, String_Builder* sb) {
         fprintf(stderr, "ERROR: could not open %s\n", path);
         return false;
     }
-    
+
     streamsize size = file.tellg();
     file.seekg(0, ios::beg);
-    
+
     sb->count = size;
     sb->capacity = size + 1;
     sb->items = (char*)malloc(sb->capacity);
-    
+
     if (!file.read(sb->items, size)) {
         fprintf(stderr, "ERROR: could not read %s\n", path);
         return false;
     }
-    
+
     return true;
 }
 
@@ -83,7 +86,6 @@ char* temp_sprintf(const char* fmt, ...) {
     return buffer;
 }
 
-// Your code
 enum class Storage {
     External,
     Auto
@@ -91,7 +93,7 @@ enum class Storage {
 
 struct Var {
     const char* name;
-    size_t offset;
+    size_t index;
     char* hwere;
     Storage storage;
 };
@@ -205,7 +207,7 @@ int main(int argc, char** argv) {
     argc--; argv++;
 
     cout << "WELCOME TO BONG\n";
-    
+
     if (argc <= 0) {
         usage(program_name);
         fprintf(stderr, "ERROR: no input is provided\n");
@@ -222,7 +224,8 @@ int main(int argc, char** argv) {
     const char* output_path = argv[0];
 
     vector<Var> vars;
-    size_t vars_offset;
+    size_t vars_count;
+    set<string> global_externs;
 
     String_Builder input = {};
     if (!read_entire_file(input_path, &input)) return 1;
@@ -233,19 +236,18 @@ int main(int argc, char** argv) {
                      string_store, sizeof(string_store));
 
     String_Builder output = {};
-    sb_appendf(&output, "format ELF64\n");
-    sb_appendf(&output, "section \".text\" executable\n");
+    String_Builder functions = {};
 
     while (true) {
         vars.clear();
-        vars_offset = 0;
+        vars_count = 0;
 
         stb_c_lexer_get_token(&l);
         if (l.token == CLEX_eof) break;
 
         if (!expect_clex(&l, input_path, CLEX_id)) return 1;
 
-        const char* symbol_name = l.string; // No strdup needed
+        const char* symbol_name = strdup(l.string);
         char* symbol_name_where = l.where_firstchar;
 
         if (is_keyword(l.string)) {
@@ -262,10 +264,10 @@ int main(int argc, char** argv) {
 
         stb_c_lexer_get_token(&l);
         if (l.token == '(') {
-            sb_appendf(&output, "public %s\n", symbol_name);
-            sb_appendf(&output, "%s:\n", symbol_name);
-            sb_appendf(&output, "    push rbp\n");
-            sb_appendf(&output, "    mov rbp, rsp\n");
+            sb_appendf(&functions, "public %s\n", symbol_name);
+            sb_appendf(&functions, "%s:\n", symbol_name);
+            sb_appendf(&functions, "    push rbp\n");
+            sb_appendf(&functions, "    mov rbp, rsp\n");
 
             if (!get_and_expect_clex(&l, input_path, ')')) return 1;
             if (!get_and_expect_clex(&l, input_path, '{')) return 1;
@@ -273,26 +275,182 @@ int main(int argc, char** argv) {
             while (true) {
                 stb_c_lexer_get_token(&l);
                 if (l.token == '}') {
-                    sb_appendf(&output, "    add rsp, %zu\n", vars_offset);
-                    sb_appendf(&output, "    pop rbp\n");
-                    sb_appendf(&output, "    mov rax, 0\n");
-                    sb_appendf(&output, "    ret\n");
+                    sb_appendf(&functions, "    mov rsp, rbp\n");
+                    sb_appendf(&functions, "    pop rbp\n");
+                    sb_appendf(&functions, "    mov rax, 0\n");
+                    sb_appendf(&functions, "    ret\n");
                     break;
                 }
 
-                print_todo_and_abort(&l, input_path, l.where_firstchar, "statement parsing not implemented yet");
+                if (!expect_clex(&l, input_path, CLEX_id)) return 1;
+
+                // exteren logic
+                if (strcmp(l.string, "extrn") == 0) {
+                    if (!get_and_expect_clex(&l, input_path, CLEX_id)) return 1;
+
+                    const char* name = strdup(l.string);
+                    char* name_where = l.where_firstchar;
+
+                    Var* existing_var = find_var(vars, name);
+                    if (existing_var) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg), "redefinition of variable `%s`", name);
+                        print_token_error(&l, input_path, name_where, msg);
+                        print_token_note(&l, input_path, existing_var->hwere, "the first declaration is located here");
+                        return 1;
+                    }
+
+                    vars.push_back(Var{name, 0, name_where, Storage::External});
+                    global_externs.insert(name);
+
+                    if (!get_and_expect_clex(&l, input_path, ';')) return 1;
+                }
+                // auto keyboard logic
+                else if (strcmp(l.string, "auto") == 0) {
+                    if (!get_and_expect_clex(&l, input_path, CLEX_id)) return 1;
+
+                    const char* name = strdup(l.string);
+                    char* name_where = l.where_firstchar;
+
+                    Var* existing_var = find_var(vars, name);
+                    if (existing_var) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg), "redefinition of variable `%s`", name);
+                        print_token_error(&l, input_path, name_where, msg);
+                        print_token_note(&l, input_path, existing_var->hwere, "the first declaration is located here");
+                        return 1;
+                    }
+
+                    vars_count++;
+                    vars.push_back(Var{name, vars_count, name_where, Storage::Auto});
+                    sb_appendf(&functions, "    sub rsp, 8\n");
+
+                    if (!get_and_expect_clex(&l, input_path, ';')) return 1;
+                }
+                //  function call
+                else {
+                    const char* name = strdup(l.string);
+                    char* name_where = l.where_firstchar;
+
+                    stb_c_lexer_get_token(&l);
+
+                    // assign token parsing
+                    if (l.token == '=') {
+                        Var* var_def = find_var(vars, name);
+                        if (!var_def) {
+                            char msg[256];
+                            snprintf(msg, sizeof(msg), "could not find variable `%s`", name);
+                            print_token_error(&l, input_path, name_where, msg);
+                            return 1;
+                        }
+
+                        if (var_def->storage == Storage::Auto) {
+                            stb_c_lexer_get_token(&l);
+
+                            if (l.token == CLEX_intlit) {
+                                sb_appendf(&functions, "    mov QWORD [rbp-%zu], %ld\n",
+                                          var_def->index * 8, l.int_number);
+                            }
+                            else if (l.token == CLEX_id) {
+                                const char* other_name = l.string;
+                                Var* other_var = find_var(vars, other_name);
+                                if (!other_var) {
+                                    char msg[256];
+                                    snprintf(msg, sizeof(msg), "could not find variable `%s`", other_name);
+                                    print_token_error(&l, input_path, l.where_firstchar, msg);
+                                    return 1;
+                                }
+
+                                if (other_var->storage == Storage::Auto) {
+                                    sb_appendf(&functions, "    mov rax, [rbp-%zu]\n", other_var->index * 8);
+                                    sb_appendf(&functions, "    mov QWORD [rbp-%zu], rax\n", var_def->index * 8);
+                                } else {
+                                    print_todo_and_abort(&l, input_path, name_where,
+                                                       "assignment from external variables");
+                                }
+                            }
+                            else {
+                                char msg[256];
+                                snprintf(msg, sizeof(msg), "Unexpected token %s, we only support assigning variables and int literals for now",
+                                        display_token_kind_temp(l.token));
+                                print_todo_and_abort(&l, input_path, l.where_firstchar, msg);
+                            }
+                        } else {
+                            print_todo_and_abort(&l, input_path, name_where,
+                                               "assignment to external variables");
+                        }
+
+                        if (!get_and_expect_clex(&l, input_path, ';')) return 1;
+                    }
+                    else if (l.token == '(') {
+                        Var* var_def = find_var(vars, name);
+                        if (!var_def) {
+                            char msg[256];
+                            snprintf(msg, sizeof(msg), "could not find function `%s`", name);
+                            print_token_error(&l, input_path, name_where, msg);
+                            return 1;
+                        }
+
+                        stb_c_lexer_get_token(&l);
+
+                        bool has_arg = (l.token != ')');
+                        if (has_arg) {
+                            if (l.token == CLEX_id) {
+                                Var* arg_var = find_var(vars, l.string);
+                                if (!arg_var) {
+                                    char msg[256];
+                                    snprintf(msg, sizeof(msg), "could not find variable `%s`", l.string);
+                                    print_token_error(&l, input_path, l.where_firstchar, msg);
+                                    return 1;
+                                }
+                                sb_appendf(&functions, "    mov rdi, [rbp-%zu]\n", arg_var->index * 8);
+                            }
+                            else if (l.token == CLEX_intlit) {
+                                sb_appendf(&functions, "    mov rdi, %ld\n", l.int_number);
+                            }
+                            else {
+                                char msg[256];
+                                snprintf(msg, sizeof(msg), "Unexpected token %s, we only support passing variables and int literals for now",
+                                        display_token_kind_temp(l.token));
+                                print_todo_and_abort(&l, input_path, l.where_firstchar, msg);
+                            }
+
+                            if (!get_and_expect_clex(&l, input_path, ')')) return 1;
+                        }
+
+                        if (var_def->storage == Storage::External) {
+                            sb_appendf(&functions, "    call %s\n", name);
+                        } else {
+                            print_todo_and_abort(&l, input_path, name_where,
+                                               "calling functions from auto variables");
+                        }
+
+                        if (!get_and_expect_clex(&l, input_path, ';')) return 1;
+                    }
+                    else {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg), "unexpected token %s", display_token_kind_temp(l.token));
+                        print_token_error(&l, input_path, l.where_firstchar, msg);
+                        return 1;
+                    }
+                }
             }
         } else {
-            print_todo_and_abort(&l, input_path, l.where_firstchar, "variable definitions not implemented yet");
+            print_todo_and_abort(&l, input_path, l.where_firstchar, "variable definitions");
         }
+    }
+
+    sb_appendf(&output, "format ELF64\n");
+    for (const auto& ext : global_externs) {
+        sb_appendf(&output, "extrn %s\n", ext.c_str());
+    }
+    sb_appendf(&output, "\n");
+    sb_appendf(&output, "section \".text\" executable\n");
+
+    if (functions.items) {
+        sb_appendf(&output, "%.*s", (int)functions.count, functions.items);
     }
 
     if (!write_entire_file(output_path, output.items, output.count)) return 69;
     return 0;
 }
-
-
- 5d67bc6b29ccbccdea484dcaac2304a4c4670cc1
-
-
- 46e174d66509ef119b8c0585519ef276651d7a8a
