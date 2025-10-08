@@ -33,7 +33,7 @@ I'm particularly interested in learning more about optimization ordering, Static
 
 
 
-
+ Have been working on this for some weeks  on my local system. Still not accustomed to GitHub so hadn't pushed to githuh while i was working on this.
 
 
 
